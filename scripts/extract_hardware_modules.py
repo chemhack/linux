@@ -79,6 +79,24 @@ class KernelModuleExtractor:
         re.MULTILINE | re.DOTALL
     )
 
+    # Pattern to find sscanf compatible string patterns
+    SSCANF_COMPAT_PATTERN = re.compile(
+        r'sscanf\s*\(\s*compat[^,]*,\s*"([^"]+)"',
+        re.MULTILINE
+    )
+
+    # Map sscanf format specifiers to regex
+    SSCANF_TO_REGEX = {
+        '%u': r'\d+',
+        '%d': r'-?\d+',
+        '%x': r'[0-9a-fA-F]+',
+        '%08x': r'[0-9a-fA-F]{8}',
+        '%01x': r'[0-9a-fA-F]',
+        '%04hx': r'[0-9a-fA-F]{4}',
+        '%02hhx': r'[0-9a-fA-F]{2}',
+        '%hx': r'[0-9a-fA-F]+',
+    }
+
     def __init__(self, kernel_root: str, parallel: int = 4, verbose: bool = False):
         self.kernel_root = Path(kernel_root)
         self.parallel = parallel
@@ -342,6 +360,113 @@ class KernelModuleExtractor:
             if len(parts) == 2:
                 return parts[1]  # Return device part
         return compatible
+
+    def _sscanf_to_regex(self, sscanf_fmt: str) -> str:
+        """Convert sscanf format string to regex pattern."""
+        pattern = re.escape(sscanf_fmt)
+        # Replace format specifiers with regex equivalents (longest first)
+        for fmt, regex in sorted(self.SSCANF_TO_REGEX.items(), key=lambda x: -len(x[0])):
+            pattern = pattern.replace(re.escape(fmt), regex)
+        return f'^{pattern}$'
+
+    def extract_sscanf_patterns(self) -> List[tuple]:
+        """Extract sscanf-based compatible string patterns from driver files."""
+        patterns = []
+        for file_path in self.find_driver_files():
+            try:
+                content = file_path.read_text(errors='ignore')
+            except:
+                continue
+
+            rel_path = str(file_path.relative_to(self.kernel_root))
+
+            for match in self.SSCANF_COMPAT_PATTERN.finditer(content):
+                sscanf_fmt = match.group(1)
+                regex_pattern = self._sscanf_to_regex(sscanf_fmt)
+                patterns.append((sscanf_fmt, regex_pattern, rel_path))
+
+        return patterns
+
+    def extract_yaml_compatible_strings(self) -> set:
+        """Extract all compatible strings from YAML device tree bindings."""
+        yaml_compats = set()
+        binding_path = self.kernel_root / "Documentation" / "devicetree" / "bindings"
+
+        if not binding_path.exists():
+            return yaml_compats
+
+        for yaml_file in binding_path.rglob("*.yaml"):
+            try:
+                content = yaml_file.read_text(errors='ignore')
+                # Match vendor,device patterns (vendor is 2+ lowercase chars)
+                matches = re.findall(r'["\']?([a-z][a-z0-9]+,[a-z0-9][-a-z0-9.]*)["\']?', content)
+                yaml_compats.update(matches)
+            except:
+                pass
+
+        return yaml_compats
+
+    def extract_dts_compatible_strings(self) -> set:
+        """Extract all compatible strings from device tree source files."""
+        dts_compats = set()
+
+        # Search in arch/ for .dts and .dtsi files
+        for arch_dir in (self.kernel_root / "arch").iterdir():
+            if not arch_dir.is_dir():
+                continue
+            dts_path = arch_dir / "boot" / "dts"
+            if not dts_path.exists():
+                continue
+
+            for dts_file in dts_path.rglob("*.dts*"):
+                try:
+                    content = dts_file.read_text(errors='ignore')
+                    # Match compatible = "vendor,device" patterns
+                    matches = re.findall(r'compatible\s*=\s*"([^"]+)"', content)
+                    for match in matches:
+                        # Split on comma-separated compatible strings
+                        for compat in match.split('", "'):
+                            compat = compat.strip().strip('"')
+                            if ',' in compat:
+                                dts_compats.add(compat)
+                except:
+                    pass
+
+        return dts_compats
+
+    def expand_sscanf_patterns(self) -> List[tuple]:
+        """Expand sscanf patterns by matching against YAML and DTS compatible strings."""
+        sscanf_patterns = self.extract_sscanf_patterns()
+        if not sscanf_patterns:
+            return []
+
+        # Combine YAML and DTS compatible strings
+        self.log("Extracting compatible strings from YAML bindings...")
+        yaml_compats = self.extract_yaml_compatible_strings()
+        self.log("Extracting compatible strings from device tree files...")
+        dts_compats = self.extract_dts_compatible_strings()
+        all_compats = yaml_compats | dts_compats
+
+        if not all_compats:
+            return []
+
+        self.log(f"Found {len(sscanf_patterns)} sscanf patterns")
+        self.log(f"Found {len(yaml_compats)} YAML + {len(dts_compats)} DTS = {len(all_compats)} unique compatible strings")
+
+        expanded = []
+        for sscanf_fmt, regex_pattern, driver_file in sscanf_patterns:
+            try:
+                pattern_re = re.compile(regex_pattern)
+                matched = [c for c in all_compats if pattern_re.match(c)]
+                for compat in matched:
+                    hw_model = self._guess_hw_model(compat, "", "")
+                    expanded.append((compat, hw_model, driver_file, sscanf_fmt))
+                if matched:
+                    self.log(f"  Pattern '{sscanf_fmt}' matched {len(matched)} compatible strings")
+            except re.error as e:
+                self.log(f"  Invalid regex for '{sscanf_fmt}': {e}")
+
+        return expanded
 
     def find_driver_files(self, drivers_path: str = "drivers") -> Iterator[Path]:
         """Find all C source files that might contain of_device_id tables."""
