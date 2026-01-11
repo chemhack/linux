@@ -67,9 +67,15 @@ class KernelModuleExtractor:
         re.MULTILINE | re.DOTALL
     )
 
-    # Pattern to find of_device_id table definitions
-    OF_DEVICE_ID_PATTERN = re.compile(
-        r'static\s+const\s+struct\s+of_device_id\s+(\w+)\s*\[\s*\]\s*=\s*\{([^}]+(?:\{[^}]*\}[^}]*)*)\}',
+    # Pattern to find of_device_id table start
+    OF_DEVICE_ID_START = re.compile(
+        r'static\s+const\s+struct\s+of_device_id\s+(\w+)\s*\[\s*\]\s*=\s*\{',
+        re.MULTILINE
+    )
+
+    # Pattern to extract .data field with cast - handles (void *) casts
+    DATA_WITH_CAST_PATTERN = re.compile(
+        r'\.compatible\s*=\s*"([^"]+)"\s*,\s*\.data\s*=\s*(?:\([^)]*\)\s*)?&?(\w+)',
         re.MULTILINE | re.DOTALL
     )
 
@@ -248,6 +254,41 @@ class KernelModuleExtractor:
             return parts[0]
         return "unknown"
 
+    def _find_matching_brace(self, content: str, start_pos: int) -> int:
+        """Find the position of the closing brace that matches the opening brace at start_pos."""
+        depth = 1
+        pos = start_pos + 1
+        in_string = False
+        in_char = False
+        escape_next = False
+
+        while pos < len(content) and depth > 0:
+            char = content[pos]
+
+            if escape_next:
+                escape_next = False
+                pos += 1
+                continue
+
+            if char == '\\':
+                escape_next = True
+                pos += 1
+                continue
+
+            if char == '"' and not in_char:
+                in_string = not in_string
+            elif char == "'" and not in_string:
+                in_char = not in_char
+            elif not in_string and not in_char:
+                if char == '{':
+                    depth += 1
+                elif char == '}':
+                    depth -= 1
+
+            pos += 1
+
+        return pos if depth == 0 else -1
+
     def extract_from_file(self, file_path: Path) -> Iterator[tuple]:
         """Extract compatible strings and hardware models from a driver file."""
         try:
@@ -258,26 +299,38 @@ class KernelModuleExtractor:
 
         rel_path = str(file_path.relative_to(self.kernel_root))
 
-        # Find all of_device_id table definitions
-        for match in self.OF_DEVICE_ID_PATTERN.finditer(content):
+        # Find all of_device_id table definitions using brace counting
+        for match in self.OF_DEVICE_ID_START.finditer(content):
             table_name = match.group(1)
-            table_content = match.group(2)
+            start_pos = match.end() - 1  # Position of opening brace
 
-            # Extract compatible strings and data from this table
-            for data_match in self.DATA_PATTERN.finditer(table_content):
+            # Find matching closing brace
+            end_pos = self._find_matching_brace(content, start_pos)
+            if end_pos == -1:
+                continue
+
+            table_content = content[start_pos:end_pos]
+
+            # Extract compatible strings with .data field (handles casts like (void *))
+            data_compatibles = set()
+            for data_match in self.DATA_WITH_CAST_PATTERN.finditer(table_content):
                 compatible = data_match.group(1)
                 hw_model = data_match.group(2)
+                data_compatibles.add(compatible)
                 yield (compatible, hw_model, rel_path)
 
-            # Collect compatible strings that already have .data field
-            data_compatibles = set(m.group(1) for m in self.DATA_PATTERN.finditer(table_content))
+            # Also try the simpler DATA_PATTERN for entries without casts
+            for data_match in self.DATA_PATTERN.finditer(table_content):
+                compatible = data_match.group(1)
+                if compatible not in data_compatibles:
+                    hw_model = data_match.group(2)
+                    data_compatibles.add(compatible)
+                    yield (compatible, hw_model, rel_path)
 
-            # Also extract compatible strings without .data field
+            # Extract compatible strings without .data field
             for compat_match in self.COMPATIBLE_PATTERNS[0].finditer(table_content):
                 compatible = compat_match.group(1)
-                # Check if we already found this with a data field
                 if compatible not in data_compatibles:
-                    # Try to find hardware model from surrounding context
                     hw_model = self._guess_hw_model(compatible, table_name, content)
                     yield (compatible, hw_model, rel_path)
 
